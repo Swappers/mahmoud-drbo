@@ -11,6 +11,7 @@ import itertools
 import csv
 import random
 from config_bot import *
+import datetime
 
 # TODO &help
 # TODO &m help 
@@ -21,10 +22,288 @@ from config_bot import *
 
 PREFIX = Config.PREFIX
 TOKEN = Config.TOKEN
-DELETE_AFTER = 10
+DELETE_AFTER = Config.DELETE_AFTER
 
+
+#memes 
+file = open("content/memes.txt")
+memes_array = []
+for line in file.readlines():
+    y = [value for value in line.strip().split('\t')]
+    memes_array.append(y)
+file.close()
 
 client = commands.Bot(command_prefix=PREFIX)
+
+
+#category
+file = open("content/category.txt")
+category_array = []
+for line in file.readlines():
+    y = [value for value in line.strip().split('\t')]
+    category_array.append(y)
+file.close()
+
+
+class VoiceEntry:
+    def __init__(self, message, player):
+        self.requester = message.author
+        self.channel = message.channel
+        self.player = player
+
+    def __str__(self):
+        fmt = '*{0.title}* [{1.display_name}]'
+        duration = self.player.duration
+        if duration:
+            fmt = fmt + ' [Longueur: {0[0]}m {0[1]}s]'.format(divmod(duration, 60))
+            
+        return fmt.format(self.player, self.requester)
+
+
+class VoiceState:
+    def __init__(self, bot):
+        self.current = None
+        self.voice = None
+        self.bot = bot
+        self.play_next_song = asyncio.Event()
+        self.songs = asyncio.Queue()
+        self.audio_player = self.bot.loop.create_task(self.audio_player_task())
+
+    def is_playing(self):
+        if self.voice is None or self.current is None:
+            return False
+
+        player = self.current.player
+        return not player.is_done()
+    
+    @property
+    def player(self):
+        return self.current.player
+
+    def skip(self):
+        if self.is_playing():
+            self.player.stop()
+
+    def toggle_next(self):
+        self.bot.loop.call_soon_threadsafe(self.play_next_song.set)
+
+    async def audio_player_task(self):
+        while True:
+            self.play_next_song.clear()
+            self.current = await self.songs.get()
+            await self.bot.send_message(self.current.channel, 'Lecture de ' + str(self.current))
+            self.current.player.start()
+            await self.play_next_song.wait()
+
+class Music:
+    """Voice related commands.
+    Works in multiple servers at once.
+    """
+    def __init__(self, bot):
+        self.bot = bot
+        self.voice_states = {}
+
+    def get_voice_state(self, server):
+        state = self.voice_states.get(server.id)
+        if state is None:
+            state = VoiceState(self.bot)
+            self.voice_states[server.id] = state
+
+        return state
+
+    async def create_voice_client(self, channel):
+        voice = await self.bot.join_voice_channel(channel)
+        state = self.get_voice_state(channel.server)
+        state.voice = voice
+
+    def __unload(self):
+        for state in self.voice_states.values():
+            try:
+                state.audio_player.cancel()
+                if state.voice:
+                    self.bot.loop.create_task(state.voice.disconnect())
+            except:
+                pass
+
+    @commands.command(pass_context=True, no_pm=True)
+    async def summon(self, ctx):
+        """Summons the bot to join your voice channel."""
+        summoned_channel = ctx.message.author.voice_channel
+        if summoned_channel is None:
+            await self.bot.say("T'es dans aucun channel connard.", delete_after = DELETE_AFTER)
+            return False
+
+        state = self.get_voice_state(ctx.message.server)
+        if state.voice is None:
+            state.voice = await self.bot.join_voice_channel(summoned_channel)
+        else:
+            await state.voice.move_to(summoned_channel)
+
+        return True
+
+    @commands.command(pass_context=True, no_pm=True, aliases=['p', 'pl', 'pla'])
+    async def play(self, ctx, *, song : str):
+
+        state = self.get_voice_state(ctx.message.server)
+        opts = {
+            'default_search': 'auto',
+            'quiet': True,
+            'format': 'bestaudio[ext=m4a]/best',
+            'restrictfilenames': True,
+            'noplaylist': True,
+            'prefer_ffmpeg': True
+        }
+
+        if state.voice is None:
+            success = await ctx.invoke(self.summon)
+            if not success:
+                return
+
+        try:
+            player = await state.voice.create_ytdl_player(song, ytdl_options=opts, after=state.toggle_next)
+        except Exception as e:
+            fmt = 'Erreur lors de la requête : ```py\n{}: {}\n```'
+            await self.bot.send_message(ctx.message.channel, fmt.format(type(e).__name__, e))
+        else:
+            player.volume = 0.2
+            entry = VoiceEntry(ctx.message, player)
+            await state.songs.put(entry)
+
+    @commands.command(pass_context=True, no_pm=True, aliases = ['volume','volum'])
+    async def vol(self, ctx, value : int):
+        """Sets the volume of the currently playing song."""
+
+        state = self.get_voice_state(ctx.message.server)
+        if state.is_playing():
+            player = state.player
+            player.volume = value / 100
+            await self.bot.say('Volume : {:.0%}'.format(player.volume), delete_after = DELETE_AFTER)
+            await self.bot.delete_message(ctx.message)
+
+    @commands.command(pass_context=True, no_pm=True)
+    async def pause(self, ctx):
+        """Pauses the currently played song."""
+        state = self.get_voice_state(ctx.message.server)
+        if state.is_playing():
+            player = state.player
+            player.pause()
+
+    @commands.command(pass_context=True, no_pm=True)
+    async def resume(self, ctx):
+        """Resumes the currently played song."""
+        state = self.get_voice_state(ctx.message.server)
+        if state.is_playing():
+            player = state.player
+            player.resume()
+
+    @commands.command(pass_context=True, no_pm=True, aliases=['degag', 'dega', 'deg', 'd'])
+    async def stop(self, ctx):
+        """Stops playing audio and leaves the voice channel.
+        This also clears the queue.
+        """
+        server = ctx.message.server
+        state = self.get_voice_state(server)
+
+        if state.is_playing():
+            player = state.player
+            player.stop()
+
+        try:
+            state.audio_player.cancel()
+            del self.voice_states[server.id]
+            await state.voice.disconnect()
+        except:
+            pass
+        
+        await client.delete_message(ctx.message)   
+    
+
+    @commands.command(pass_context=True, no_pm=True)
+    async def skip(self, ctx):
+
+        state = self.get_voice_state(ctx.message.server)
+        if not state.is_playing():
+            await self.bot.say('Tu veux que je skip quoi fdp ?', delete_after = DELETE_AFTER)
+            return
+
+        await self.bot.say('Allez on skip...', delete_after = DELETE_AFTER)
+        state.skip()
+
+    @commands.command(pass_context=True, no_pm=True)
+    async def playing(self, ctx):
+        """Currently played song."""
+
+        state = self.get_voice_state(ctx.message.server)
+        if state.current is None:
+            await self.bot.say('Y a R frère...', delete_after = DELETE_AFTER)
+        else:
+            await self.bot.say('Lecture en cours de {}'.format(state.current), delete_after = DELETE_AFTER)
+
+    @commands.command(pass_context=True, no_pm= True, aliases=['m', 'mem', 'me'])
+    async def meme(self, ctx, *, song : str):
+
+        url=''
+        m_commands=[]
+        output =[]
+
+        for meme in memes_array:
+            m_commands.append(meme[1])
+            if(meme[1] == song):
+                meme_r = meme[1]
+                url = meme[0]
+        
+        if (song == 'help'):
+            embed = discord.Embed(title = "Commandes memes help :", description = "Aide sur les commandes de memes",color =0x00ff00)
+            for m_command in m_commands:
+                output.append(PREFIX + "m " + str(m_command))
+
+            com_str = '\n'.join(str(e) for e in output)
+            embed.add_field(name= PREFIX + "m help", value=com_str, inline = True)
+            await client.say(embed=embed)
+
+        elif not url=='':
+
+            state = self.get_voice_state(ctx.message.server)
+            if state.voice is None:
+                success = await ctx.invoke(self.summon)
+                if not success:
+                    return
+
+            try:
+                if (url.startswith('http')):
+                    player = await state.voice.create_ytdl_player(url, after=state.toggle_next)
+                    entry = VoiceEntry(ctx.message, player)
+                else:
+                    if state.is_playing():
+                        player_prev = state.player
+                        player_prev.pause()
+                    local_link = url+ str(meme_r)+'.mp3'
+                    player = state.voice.create_ffmpeg_player(local_link)
+                    entry = '*'+ meme_r + '* ['+ ctx.message.author.name+'] [Longueur: 5s]'
+
+            except Exception as e:
+                fmt = 'Erreur lors de la requête : ```py\n{}: {}\n```'
+                await self.bot.send_message(ctx.message.channel, fmt.format(type(e).__name__, e))
+
+            else:
+                player.volume = 0.2
+                print(entry)
+                if (url.startswith('http')):
+                    await state.songs.put(entry)
+                else:
+                    player.start()
+                    await asyncio.sleep(10)
+                    if state.is_playing():                    
+                        player_prev.resume()
+                        await self.bot.delete_message(ctx.message)
+
+
+
+        else:
+            await self.bot.say("Commande inconnue.", delete_after = DELETE_AFTER)
+
+        await self.bot.delete_message(ctx.message)
+
 
 @client.event
 async def on_ready():
@@ -37,6 +316,17 @@ async def on_ready():
 async def hello(ctx):
     await client.say("Va bien niquer ta mère fdp !")
 
+@client.event
+async def on_message(message):
+    if "ass to mouth" in message.content:
+        await client.send_message(message.channel, "Ok ok tbarkellah 3lik a si "+str(message.author.name)+" ...")
+    elif "viens de chier" in message.content:
+        today = datetime.date.today()
+        await client.send_message(message.channel, today.strftime('%d %B % %Y') + "Libération de Nelson Mandela en Afrique du Sud. Quelques heures après que le président de l'Afrique du Sud, Frederik de Klerk, en eut fait l'annonce, le militant de la lutte anti-apartheid Nelson Mandela est libéré après 27 ans d'incarcération...")
+    elif "boutef" in message.content:
+        await client.send_message(message.channel, "T'inquiètes, j'enregistre tout :incoming_envelope: :innocent: ")
+
+    await client.process_commands(message)
 
 @client.command(pass_context=True)
 async def info(ctx, user : discord.Member):
@@ -61,8 +351,6 @@ async def sinfo(ctx):
 
     await client.say(embed=embed, delete_after = DELETE_AFTER)
 
-# clear : Pour supprimer tous les messages du channel // TODO @author 
-
 @client.command(pass_context = True, aliases=['clea', 'cle', 'cl', 'c'])
 async def clear(ctx, number = 1, author : discord.Member = None):
     messages = []
@@ -71,111 +359,9 @@ async def clear(ctx, number = 1, author : discord.Member = None):
         if (author is None):
             messages.append(message)
         else:
-            if message.author == author:
+            if str(message.author).startswith(str(author)):
                 messages.append(message)
     await client.delete_messages(messages)
-
-
-
-
-#m 
-file = open("content/memes.txt")
-memes_array = []
-for line in file.readlines():
-    y = [value for value in line.strip().split('\t')]
-    memes_array.append(y)
-
-
-file.close()
-
-@client.command(pass_context=True, aliases=['meme', 'mem', 'me'])
-async def m(ctx, arg):
-
-    url=''
-    m_commands=[]
-    output =[]
-    
-    for meme in memes_array:
-        m_commands.append(meme[1])
-        if(meme[1] == arg):
-            url = meme[0]
-    
-    if (arg == 'help'):
-        embed = discord.Embed(title = "Commandes memes help :", description = "Aide sur les commandes de memes",color =0x00ff00)
-        for m_command in m_commands:
-             output.append(PREFIX + "m " + str(m_command))
-
-        com_str = '\n'.join(str(e) for e in output)
-        embed.add_field(name= PREFIX + "m help", value=com_str, inline = True)
-        await client.say(embed=embed)
-
-    elif  not url=='':
-
-        summoned_channel = ctx.message.author.voice_channel
-        if summoned_channel is None:
-            await client.say("Tu n'es pas dans un channel connard !")
-            return False
-
-        if not client.is_voice_connected(ctx.message.server):
-            vc = await client.join_voice_channel(summoned_channel)
-        else:
-            vc = client.voice_client_in(ctx.message.server)
-
-        player = await vc.create_ytdl_player(url)
-        player.volume = 0.3
-        player.start()
-    
-    else:
-        await client.say("Commande inconnue.", delete_after = DELETE_AFTER)
-
-    await client.delete_message(ctx.message)
-
-
-@client.command(pass_context=True, aliases=['play', 'pl', 'pla'])
-async def p(ctx, url):
-
-    summoned_channel = ctx.message.author.voice_channel
-    if summoned_channel is None:
-        await client.say("Tu n'es pas dans un channel connard !")
-        return False
-
-    if not client.is_voice_connected(ctx.message.server):
-        vc = await client.join_voice_channel(summoned_channel)
-    else:
-        vc = client.voice_client_in(ctx.message.server)
-
-    player = await vc.create_ytdl_player(url)
-    player.volume = 0.1
-    player.start()
-
-    await asyncio.sleep(60)
-    await client.delete_message(ctx.message)
-
-
-
-
-@client.command(pass_context=True, aliases=['degag', 'dega', 'deg', 'd'])
-async def degage(ctx):
-    server = ctx.message.server
-    voice_client = client.voice_client_in(server)
-    if voice_client:
-        await voice_client.disconnect()
-        print("J'me tire !")
-    else:
-        print("J'étais même pas là connard")
-    
-    await client.delete_message(ctx.message)
-
-
-#m 
-file = open("content/category.txt")
-category_array = []
-for line in file.readlines():
-    y = [value for value in line.strip().split('\t')]
-    category_array.append(y)
-
-
-file.close()
 
 @client.command(pass_context=True, aliases=['cat'])
 async def category(ctx,arg = None):
@@ -219,9 +405,8 @@ async def category(ctx,arg = None):
 
     await client.say(embed=embed, delete_after= DELETE_AFTER)
     await asyncio.sleep(10)
-    await client.delete_message(ctx.message)
-    
+    await client.delete_message(ctx.message)    
 
     
-
+client.add_cog(Music(client))
 client.run(TOKEN)
