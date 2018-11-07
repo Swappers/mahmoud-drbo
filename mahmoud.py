@@ -13,12 +13,6 @@ import random
 from config_bot import *
 import datetime
 
-# TODO &help
-# TODO &m help 
-# TODO Que se passe t il quand on lance plusieurs &p à la fois ?
-# TODO clear @user number
-# TODO search yt
-
 
 PREFIX = Config.PREFIX
 TOKEN = Config.TOKEN
